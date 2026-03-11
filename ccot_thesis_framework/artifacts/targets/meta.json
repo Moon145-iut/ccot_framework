@@ -1,0 +1,10 @@
+{
+  "model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+  "hidden_size": 896,
+  "compression_ratio": 0.1,
+  "selector": "evenly_spaced",
+  "hidden_layer_index": -2,
+  "num_samples": 64,
+  "max_latent": 19,
+  "max_length": 1024
+}
