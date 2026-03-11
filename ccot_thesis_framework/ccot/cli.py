@@ -13,19 +13,20 @@ from ccot.config import (
     DEFAULT_MAX_LENGTH,
     DEFAULT_MODEL_ID,
     DEFAULT_NUM_THREADS,
+    RuntimeConfig,
 )
 from ccot.paper.config import PaperConfig
-from ccot.paper.gold import build_gold_targets
-from ccot.paper.phi_train import train_phi_layers
-from ccot.paper.end_train import train_end_head
-from ccot.paper.psi_train import train_psi_decoder
+from ccot.paper.gold import build_gold_cache
+from ccot.paper.train_phi import train_phi_layers
+from ccot.paper.train_end import train_end_head
+from ccot.paper.train_psi import train_psi_decoder
 from ccot.paper.export_traces import export_traces
-from ccot.paper import infer as paper_infer
 from ccot.phase2.truth_vector import build_truth_vector
 from ccot.reasoners.ccot_cpu_gru import CCOTCpuGRUReasoner
 from ccot.reasoners.ccot_paper import CCOTPaperReasoner
 from ccot.report import write_run_report
 from ccot.utils.io import read_jsonl
+from ccot.eval.run_eval import run_eval
 
 
 def _positive_float(value: str) -> float:
@@ -51,6 +52,39 @@ def _paper_config_from_args(args: argparse.Namespace) -> PaperConfig:
         artifacts_dir=artifacts_dir,
         report_path=report_path,
     )
+    cfg.csv_path = Path(args.csv) if getattr(args, "csv", None) else None
+    cfg.runtime = RuntimeConfig(
+        device=args.device,
+        dtype=getattr(args, "dtype", "float32"),
+        flash_attention=getattr(args, "flash_attn", False),
+        gradient_checkpointing=getattr(args, "grad_ckpt", False),
+        tf32=not getattr(args, "no_tf32", False),
+    )
+    return cfg
+
+
+def _paper_cfg_from_artifacts(args: argparse.Namespace) -> PaperConfig:
+    artifacts_dir = Path(getattr(args, "artifacts_dir", "artifacts"))
+    cfg = PaperConfig(model_id=getattr(args, "model_id", DEFAULT_MODEL_ID), artifacts_dir=artifacts_dir)
+    meta_path = artifacts_dir / "gold" / "paper_meta.json"
+    if meta_path.exists():
+        try:
+            info = json.loads(meta_path.read_text())
+            cfg.layer_l = info.get("layer_l")
+            cfg.scorer_T = info.get("scorer_T", cfg.scorer_T)
+            cfg.compression_ratio = info.get("compression_ratio", cfg.compression_ratio)
+            cfg.max_seq_len = info.get("max_seq_len", cfg.max_seq_len)
+        except Exception:
+            pass
+    if getattr(args, "paper_r", None) is not None:
+        cfg.compression_ratio = args.paper_r
+    cfg.runtime = RuntimeConfig(
+        device=getattr(args, "device", "cpu"),
+        dtype=getattr(args, "dtype", "float32"),
+        flash_attention=getattr(args, "flash_attn", False),
+        gradient_checkpointing=getattr(args, "grad_ckpt", False),
+        tf32=not getattr(args, "no_tf32", False),
+    )
     return cfg
 
 
@@ -59,7 +93,9 @@ def _add_paper_args(subparser: argparse.ArgumentParser, require_csv: bool = Fals
     subparser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     subparser.add_argument("--layer-l", type=int, default=16)
     subparser.add_argument("--scorer-T", dest="scorer_T", type=int, default=3)
-    subparser.add_argument("--compression-ratio", type=float, default=0.12)
+    cr_group = subparser.add_mutually_exclusive_group()
+    cr_group.add_argument("--compression-ratio", dest="compression_ratio", type=float, default=0.12)
+    cr_group.add_argument("--r", dest="compression_ratio", type=float)
     subparser.add_argument("--max-seq-len", type=int, default=2048)
     subparser.add_argument("--stop-cap", type=int, default=0)
     subparser.add_argument("--subset-method", default="evenly")
@@ -67,6 +103,10 @@ def _add_paper_args(subparser: argparse.ArgumentParser, require_csv: bool = Fals
     subparser.add_argument("--limit-samples", type=int)
     subparser.add_argument("--device", default="cpu")
     subparser.add_argument("--artifacts-dir", default="artifacts")
+    subparser.add_argument("--dtype", default="float32")
+    subparser.add_argument("--flash-attn", action="store_true", dest="flash_attn")
+    subparser.add_argument("--grad-ckpt", action="store_true", dest="grad_ckpt")
+    subparser.add_argument("--no-tf32", action="store_true")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -123,7 +163,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     inf = subparsers.add_parser("infer", help="Run local inference")
     inf.add_argument("--question", required=True)
-    inf.add_argument("--backend", choices=["cpu_gru", "paper"], default="cpu_gru")
+    inf.add_argument("--backend", choices=["cpu_gru", "paper", "truth_vector"], default="cpu_gru")
     inf.add_argument("--targets-dir", help="Required for cpu_gru backend")
     inf.add_argument("--ccot-weights")
     inf.add_argument("--decoder-weights")
@@ -132,6 +172,29 @@ def _build_parser() -> argparse.ArgumentParser:
     inf.add_argument("--num-threads", type=int, default=DEFAULT_NUM_THREADS)
     inf.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     inf.add_argument("--device", default="cpu")
+    inf.add_argument("--truth-vector", help="Path to v_truth tensor for truth_vector backend")
+    inf.add_argument("--truth-alpha", type=float, default=1.0, help="Steering strength for truth_vector backend")
+
+    eval_cmd = subparsers.add_parser("eval", help="Evaluate a backend on GSM8K")
+    eval_cmd.add_argument("--backend", choices=["cpu_gru", "truth_vector", "paper"], default="cpu_gru")
+    eval_cmd.add_argument("--csv", default="ccot/data/gsm8k_random_300.csv")
+    eval_cmd.add_argument("--n", type=int, help="Number of samples to evaluate")
+    eval_cmd.add_argument("--targets-dir")
+    eval_cmd.add_argument("--ccot-weights")
+    eval_cmd.add_argument("--decoder-weights")
+    eval_cmd.add_argument("--truth-vector")
+    eval_cmd.add_argument("--truth-alpha", type=float, default=1.0)
+    eval_cmd.add_argument("--stop-threshold", type=float, default=0.5)
+    eval_cmd.add_argument("--max-latents", type=int, default=64)
+    eval_cmd.add_argument("--num-threads", type=int, default=DEFAULT_NUM_THREADS)
+    eval_cmd.add_argument("--artifacts-dir", default="artifacts")
+    eval_cmd.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    eval_cmd.add_argument("--device", default="cpu")
+    eval_cmd.add_argument("--dtype", default="float32")
+    eval_cmd.add_argument("--flash-attn", action="store_true", dest="flash_attn")
+    eval_cmd.add_argument("--grad-ckpt", action="store_true", dest="grad_ckpt")
+    eval_cmd.add_argument("--no-tf32", action="store_true")
+    eval_cmd.add_argument("--paper-r", type=float, help="Override compression ratio for paper backend")
 
     full = subparsers.add_parser("full-run", help="End-to-end training/eval")
     full.add_argument("--backend", choices=["cpu_gru", "paper"], default="cpu_gru")
@@ -143,30 +206,61 @@ def _build_parser() -> argparse.ArgumentParser:
     full.add_argument("--limit-samples", type=int)
     full.add_argument("--device", default="cpu")
 
+    dl = subparsers.add_parser("download-gsm8k", help="Download GSM8K splits from Hugging Face")
+    dl.add_argument("--split", choices=["train", "test"], default="train")
+    dl.add_argument("--out-dir", default="artifacts/datasets")
+    dl.add_argument("--repo-id", default="openai/gsm8k")
+    dl.add_argument("--revision")
+
+
     paper_gold = subparsers.add_parser("paper-build-gold", help="Build gold latents from θ")
     _add_paper_args(paper_gold, require_csv=True)
 
-    paper_phi = subparsers.add_parser("paper-train-phi", help="Train φ adapters")
+    paper_phi = subparsers.add_parser("paper-train-phi", help="Train f adapters")
     _add_paper_args(paper_phi)
-    paper_phi.add_argument("--train-path", default="artifacts/gold/paper_train.pt")
+    paper_phi.add_argument("--gold-dir", default="artifacts/gold")
+    paper_phi.add_argument("--out-dir", default="artifacts/models/paper_phi")
+    paper_phi.add_argument("--epochs-per-layer", type=int, default=1)
+    paper_phi.add_argument("--phi-lr", type=float, default=5e-5)
 
-    paper_end = subparsers.add_parser("paper-train-end", help="Train ENDψ head")
+    paper_end = subparsers.add_parser("paper-train-end", help="Train END? head")
     _add_paper_args(paper_end)
-    paper_end.add_argument("--train-path", default="artifacts/gold/paper_train.pt")
+    paper_end.add_argument("--gold-dir", default="artifacts/gold")
     paper_end.add_argument("--phi-dir", default="artifacts/models/paper_phi")
+    paper_end.add_argument("--out", default="artifacts/models/paper_end.pt")
+    paper_end.add_argument("--epochs", type=int, default=3)
+    paper_end.add_argument("--lr", type=float, default=5e-4)
 
     paper_psi = subparsers.add_parser("paper-train-psi", help="Train ψ decoder")
     _add_paper_args(paper_psi)
-    paper_psi.add_argument("--train-path", default="artifacts/gold/paper_train.pt")
+    paper_psi.add_argument("--gold-dir", default="artifacts/gold")
     paper_psi.add_argument("--phi-dir", default="artifacts/models/paper_phi")
-    paper_psi.add_argument("--joint-training", action="store_true")
+    paper_psi.add_argument("--out-dir", default="artifacts/models/paper_psi")
+    paper_psi.add_argument("--epochs", type=int, default=2)
+    paper_psi.add_argument("--lr", type=float, default=5e-5)
+    paper_psi.add_argument("--psi-rank", type=int, default=64)
 
     paper_eval = subparsers.add_parser("paper-eval", help="Evaluate paper backend")
     _add_paper_args(paper_eval, require_csv=True)
+    paper_eval.add_argument("--n", type=int, help="Number of samples to evaluate")
+    paper_eval.add_argument("--max-latents", type=int, default=200)
+    paper_eval.add_argument("--stop-threshold", type=float, default=0.5)
+    paper_eval.add_argument("--num-threads", type=int, default=DEFAULT_NUM_THREADS)
+
+    paper_infer = subparsers.add_parser("paper-infer", help="Run inference with the paper backend")
+    paper_infer.add_argument("--question", required=True)
+    paper_infer.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    paper_infer.add_argument("--artifacts-dir", default="artifacts")
+    paper_infer.add_argument("--device", default="cpu")
+    paper_infer.add_argument("--dtype", default="float32")
+    paper_infer.add_argument("--flash-attn", action="store_true", dest="flash_attn")
+    paper_infer.add_argument("--grad-ckpt", action="store_true", dest="grad_ckpt")
+    paper_infer.add_argument("--no-tf32", action="store_true")
 
     paper_export = subparsers.add_parser("paper-export-traces", help="Export traces to JSONL")
     _add_paper_args(paper_export, require_csv=True)
     paper_export.add_argument("--traces-out", default="artifacts/traces/paper_traces.jsonl")
+    paper_export.add_argument("--n", type=int, help="Limit number of samples")
 
     paper_full = subparsers.add_parser("paper-full-run", help="Paper backend end-to-end")
     _add_paper_args(paper_full, require_csv=True)
@@ -266,57 +360,76 @@ def _execute_full_run(args: argparse.Namespace) -> None:
         )
     else:
         cfg = _paper_config_from_args(args)
-        build_gold_targets(args.csv, cfg, device=args.device, limit=args.limit_samples)
+        build_gold_cache(cfg, limit=cfg.limit_samples)
         phi_res = train_phi_layers(
             cfg,
-            cfg.gold_dir() / "paper_train.pt",
+            cfg.gold_dir(),
             cfg.models_dir() / "paper_phi",
-            device=args.device,
-            limit=args.limit_samples,
+            epochs_per_layer=1,
+            lr=5e-5,
+            limit=cfg.limit_samples,
         )
         end_res = train_end_head(
             cfg,
-            cfg.gold_dir() / "paper_train.pt",
+            cfg.gold_dir(),
             cfg.models_dir() / "paper_phi",
             cfg.models_dir() / "paper_end.pt",
-            device=args.device,
-            limit=args.limit_samples,
+            epochs=3,
+            lr=5e-4,
+            limit=cfg.limit_samples,
         )
         psi_res = train_psi_decoder(
             cfg,
-            cfg.gold_dir() / "paper_train.pt",
+            cfg.gold_dir(),
             cfg.models_dir() / "paper_phi",
             cfg.models_dir() / "paper_psi",
+            epochs=2,
+            lr=5e-5,
+            psi_rank=64,
+            limit=cfg.limit_samples,
+        )
+        eval_args = argparse.Namespace(
+            backend="paper",
+            csv=args.csv,
+            n=args.limit_samples,
+            artifacts_dir=args.artifacts_dir,
+            model_id=args.model_id,
             device=args.device,
-            limit=args.limit_samples,
-            joint_training=True,
+            dtype=getattr(args, "dtype", "float32"),
+            flash_attn=getattr(args, "flash_attn", False),
+            grad_ckpt=getattr(args, "grad_ckpt", False),
+            no_tf32=getattr(args, "no_tf32", False),
+            stop_threshold=0.5,
+            max_latents=cfg.stop_limit,
+            num_threads=DEFAULT_NUM_THREADS,
+            targets_dir=None,
+            ccot_weights=None,
+            decoder_weights=None,
+            truth_vector=None,
+            truth_alpha=1.0,
+            paper_r=cfg.compression_ratio,
         )
-        reasoner = CCOTPaperReasoner(cfg, device=args.device)
-        teacher_rows = (
-            read_jsonl(cfg.teacher_jsonl)[: args.limit_samples or 8]
-            if cfg.teacher_jsonl and Path(cfg.teacher_jsonl).exists()
-            else []
-        )
-        if not teacher_rows and args.csv:
-            from ccot.data import load_gsm8k_csv
+        metrics = run_eval(eval_args, "paper")
+        from ccot.data import load_gsm8k_csv
 
-            teacher_rows = [
-                {"question": ex.question, "final_answer": ex.final_answer, "id": ex.idx}
-                for ex in load_gsm8k_csv(args.csv)[: args.limit_samples or 8]
-            ]
-        eval_metrics = _evaluate_reasoner(reasoner, teacher_rows, cfg)
+        dataset = load_gsm8k_csv(args.csv)
+        limit = args.limit_samples or len(dataset)
+        rows = [
+            {"question": ex.question, "final_answer": ex.final_answer, "id": ex.idx}
+            for ex in dataset[:limit]
+        ]
         traces_path = cfg.traces_dir() / "paper_traces.jsonl"
-        export_traces(eval_metrics["records"], cfg, traces_path)
+        export_traces(rows, cfg, traces_path, device=args.device)
         build_truth_vector(traces_path, cfg.traces_dir() / "truth_vector.pt")
         report_data = {
-            "eval": {"em": eval_metrics["em"]},
-            "avg_latency": eval_metrics["avg_latency"],
-            "avg_k": eval_metrics["avg_k"],
+            "eval": {"accuracy_em": metrics.get("accuracy_em")},
+            "avg_latency": metrics.get("avg_latency_sec"),
+            "avg_k": metrics.get("avg_reasoning_steps"),
             "phi_losses": phi_res.layer_losses,
             "end_losses": end_res.loss_history,
             "psi_losses": psi_res.loss_history,
             "dataset_sizes": {"train": len(teacher_rows), "val": 0},
-            "joint_training": psi_res.joint_training,
+            "joint_training": psi_res.joint_mode,
         }
         write_run_report(
             backend="paper",
@@ -402,70 +515,127 @@ def main(argv: list[str] | None = None) -> None:
                 num_threads=args.num_threads,
             )
             print(json.dumps(result, indent=2))
+        elif args.backend == "truth_vector":
+            missing = [
+                name
+                for name in ("targets_dir", "ccot_weights", "decoder_weights", "truth_vector")
+                if not getattr(args, name)
+            ]
+            if missing:
+                parser.error(f"truth_vector backend requires arguments: {', '.join(missing)}")
+            from ccot.reasoners.ccot_truth_vector import CCOTTruthVectorReasoner
+
+            reasoner = CCOTTruthVectorReasoner(
+                targets_dir=args.targets_dir,
+                ccot_weights=args.ccot_weights,
+                decoder_weights=args.decoder_weights,
+                truth_vector_path=args.truth_vector,
+                alpha=args.truth_alpha,
+                stop_threshold=args.stop_threshold,
+                max_latents=args.max_latents,
+                num_threads=args.num_threads,
+            )
+            trace = reasoner.run_latent(args.question, max_steps=args.max_latents)
+            answer = reasoner.decode_answer(args.question, trace)
+            payload = {
+                "answer": answer,
+                "k": trace.k,
+                "truth_steering": trace.meta.get("truth_steering"),
+            }
+            print(json.dumps(payload, indent=2))
         else:
             cfg = PaperConfig(model_id=args.model_id, limit_samples=None)
             reasoner = CCOTPaperReasoner(cfg, device=args.device)
             trace = reasoner.run_latent(args.question, max_steps=args.max_latents)
             answer = reasoner.decode_answer(args.question, trace)
             print(json.dumps({"answer": answer, "k": trace.k}, indent=2))
+    elif cmd == "eval":
+        metrics = run_eval(args, args.backend)
+        print(json.dumps(metrics, indent=2))
     elif cmd == "full-run":
         _execute_full_run(args)
+    elif cmd == "download-gsm8k":
+        from ccot.data import download_gsm8k_csv
+
+        out_path = download_gsm8k_csv(
+            args.out_dir,
+            split=args.split,
+            repo_id=args.repo_id,
+            revision=args.revision,
+        )
+        print(json.dumps({"csv": str(out_path)}, indent=2))
+
     elif cmd == "paper-build-gold":
         cfg = _paper_config_from_args(args)
-        meta = build_gold_targets(args.csv, cfg, device=args.device, limit=args.limit_samples)
+        meta = build_gold_cache(cfg, limit=cfg.limit_samples)
         print(json.dumps(meta, indent=2))
+    elif cmd == "paper-infer":
+        cfg = _paper_cfg_from_artifacts(args)
+        reasoner = CCOTPaperReasoner(cfg, device=cfg.runtime.device)
+        trace = reasoner.run_latent(args.question)
+        answer = reasoner.decode_answer(args.question, trace)
+        print(json.dumps({"answer": answer, "k": trace.k}, indent=2))
     elif cmd == "paper-train-phi":
         cfg = _paper_config_from_args(args)
         result = train_phi_layers(
             cfg,
-            args.train_path,
-            Path(cfg.models_dir()) / "paper_phi",
+            args.gold_dir,
+            args.out_dir,
             device=args.device,
+            epochs_per_layer=args.epochs_per_layer,
+            lr=args.phi_lr,
+            limit=cfg.limit_samples,
         )
         print(json.dumps(result.layer_losses, indent=2))
     elif cmd == "paper-train-end":
         cfg = _paper_config_from_args(args)
         result = train_end_head(
             cfg,
-            args.train_path,
+            args.gold_dir,
             args.phi_dir,
-            cfg.models_dir() / "paper_end.pt",
+            args.out,
             device=args.device,
+            epochs=args.epochs,
+            lr=args.lr,
+            limit=cfg.limit_samples,
         )
         print(json.dumps({"loss": result.loss_history}, indent=2))
     elif cmd == "paper-train-psi":
         cfg = _paper_config_from_args(args)
         result = train_psi_decoder(
             cfg,
-            args.train_path,
+            args.gold_dir,
             args.phi_dir,
-            cfg.models_dir() / "paper_psi",
+            args.out_dir,
             device=args.device,
-            joint_training=args.joint_training,
+            epochs=args.epochs,
+            lr=args.lr,
+            psi_rank=args.psi_rank,
+            limit=cfg.limit_samples,
         )
-        print(json.dumps({"loss": result.loss_history, "joint": result.joint_training}, indent=2))
+        print(
+            json.dumps(
+                {"loss": result.loss_history, "joint_mode": result.joint_mode},
+                indent=2,
+            )
+        )
     elif cmd == "paper-eval":
-        cfg = _paper_config_from_args(args)
-        reasoner = CCOTPaperReasoner(cfg, device=args.device)
-        from ccot.data import load_gsm8k_csv
-
-        rows = [
-            {"question": ex.question, "final_answer": ex.final_answer, "id": ex.idx}
-            for ex in load_gsm8k_csv(args.csv)[: args.limit_samples or 8]
-        ]
-        metrics = _evaluate_reasoner(reasoner, rows, cfg)
-        print(json.dumps({"em": metrics["em"]}, indent=2))
+        args.backend = "paper"
+        args.paper_r = args.compression_ratio
+        metrics = run_eval(args, "paper")
+        print(json.dumps(metrics, indent=2))
     elif cmd == "paper-export-traces":
-        cfg = _paper_config_from_args(args)
-        reasoner = CCOTPaperReasoner(cfg, device=args.device)
+        cfg = _paper_cfg_from_artifacts(args)
+        cfg.csv_path = Path(args.csv)
         from ccot.data import load_gsm8k_csv
 
+        dataset = load_gsm8k_csv(args.csv)
+        limit = args.n or args.limit_samples or len(dataset)
         rows = [
             {"question": ex.question, "final_answer": ex.final_answer, "id": ex.idx}
-            for ex in load_gsm8k_csv(args.csv)[: args.limit_samples or 8]
+            for ex in dataset[:limit]
         ]
-        metrics = _evaluate_reasoner(reasoner, rows, cfg)
-        export_traces(metrics["records"], cfg, args.traces_out)
+        export_traces(rows, cfg, args.traces_out, device=args.device)
         print(f"Wrote traces to {args.traces_out}")
     elif cmd == "paper-full-run":
         args.backend = "paper"

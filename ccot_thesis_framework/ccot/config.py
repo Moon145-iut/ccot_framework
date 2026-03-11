@@ -46,6 +46,17 @@ class PipelineDefaults:
     random_seed: int = DEFAULT_RANDOM_SEED
     artifacts_dir: Path = Path("artifacts")
 
+
+@dataclass(slots=True)
+class RuntimeConfig:
+    """Runtime knobs for loading HuggingFace backbones."""
+
+    device: str = "cpu"  # "cuda" or "cpu"
+    dtype: str = "float32"  # "bfloat16" | "float16" | "float32"
+    flash_attention: bool = False
+    gradient_checkpointing: bool = False
+    tf32: bool = True
+
 def build_paths(base_dir: str | Path, *extra: str) -> Path:
     """Return a path rooted under ``base_dir`` while creating parents."""
 
@@ -61,3 +72,16 @@ def to_serializable_dict(obj: Any) -> dict[str, Any]:
     if hasattr(obj, "__dict__"):
         return {k: to_serializable_dict(v) for k, v in obj.__dict__.items()}
     return dict(obj)
+
+
+def resolve_torch_dtype(dtype: str | None) -> torch.dtype:
+    """Map string dtype to torch dtype."""
+
+    if dtype is None:
+        return torch.float32
+    key = dtype.lower()
+    if key in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if key in {"fp16", "float16", "half"}:
+        return torch.float16
+    return torch.float32
